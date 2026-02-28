@@ -1,3 +1,16 @@
+Metadata-Version: 2.4
+Name: strataai
+Version: 0.1.0
+Summary: Cognitive Agentic Storage Control Plane: Lustre connection + tiering intelligence
+License: Apache-2.0
+Keywords: lustre,hpc,storage,tiering,ai,control-plane
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+Requires-Dist: ruff>=0.3; extra == "dev"
+
 # StrataAI
 
 **"Strata" -> storage layers** -- Lustre connection + tiering intelligence with AI.
