@@ -11,7 +11,7 @@ Runs fully ASYNC – never on the CRUD hot path.
 from __future__ import annotations
 
 import logging
-import math
+from datetime import date
 from typing import Any
 
 import mcp_client
@@ -140,6 +140,26 @@ def process(event: dict[str, Any]) -> bool:
     except Exception as exc:
         logger.error("Failed to write AI features for %s/%s/%s: %s", tenant_id, bucket, key, exc)
         return False
+
+    # 5. Update daily prefix rollup (best-effort; profiler contributes PUT counts
+    #    and category/compressibility aggregates).
+    prefix = event.get("hints", {}).get("prefix") or (
+        "/".join(key.split("/")[:-1]) + "/" if "/" in key else ""
+    )
+    today = date.today().isoformat()
+    prefix_stats: dict[str, Any] = {
+        "put_count": 1,
+        "dominant_category": category,
+        "dominant_data_type": data_type,
+        "avg_compressibility_est": compressibility,
+    }
+    if size_bytes is not None:
+        prefix_stats["total_bytes"] = size_bytes
+    try:
+        mcp_client.write_prefix_stats_daily(tenant_id, bucket, prefix, today, prefix_stats)
+    except Exception as exc:
+        logger.warning("Prefix stats update failed for %s/%s/%s: %s", tenant_id, bucket, prefix, exc)
+        # non-fatal – object features already written
 
     logger.info("[%s] Done profiling %s/%s/%s → category=%s", _AGENT_NAME, tenant_id, bucket, key, category)
     return True

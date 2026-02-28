@@ -13,8 +13,7 @@ inactive objects decay toward zero.
 from __future__ import annotations
 
 import logging
-import math
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 from typing import Any
 
 import mcp_client
@@ -68,5 +67,19 @@ def process(event: dict[str, Any]) -> bool:
     except Exception as exc:
         logger.error("Failed to update hotness for %s/%s/%s: %s", tenant_id, bucket, key, exc)
         return False
+
+    # Update prefix hotness rollup (best-effort)
+    prefix = event.get("hints", {}).get("prefix") or (
+        "/".join(key.split("/")[:-1]) + "/" if "/" in key else ""
+    )
+    today = date.today().isoformat()
+    try:
+        mcp_client.write_prefix_stats_daily(
+            tenant_id, bucket, prefix, today,
+            {"get_count": 1, "hotness_score": round(new_score, 4)},
+        )
+    except Exception as exc:
+        logger.warning("Prefix hotness update failed for %s/%s/%s: %s", tenant_id, bucket, prefix, exc)
+        # non-fatal
 
     return True

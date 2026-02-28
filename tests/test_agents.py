@@ -16,6 +16,11 @@ else:
     sys.path.insert(0, _AGENT_DIR)
 
 
+def _raise(exc: Exception):
+    """Helper: raise *exc* inside a lambda-compatible callable."""
+    raise exc
+
+
 # ---------------------------------------------------------------------------
 # Metadata Profiler Agent
 # ---------------------------------------------------------------------------
@@ -100,7 +105,7 @@ def test_metadata_profiler_process_handles_mcp_write_failure(monkeypatch):
     )
     monkeypatch.setattr(
         "agents.metadata_profiler.mcp_client.write_ai_object_features",
-        lambda *a, **kw: (_ for _ in ()).throw(Exception("Cassandra down"))
+        lambda *a, **kw: _raise(Exception("Cassandra down"))
     )
 
     event = {"event_type": "PutCommitted", "tenant_id": "t1",
@@ -116,7 +121,129 @@ def test_metadata_profiler_process_handles_mcp_write_failure(monkeypatch):
 from agents import hotness_agent
 
 
-def test_hotness_agent_decayed_score_from_zero():
+def test_metadata_profiler_updates_prefix_stats(monkeypatch):
+    """Metadata profiler must call write_prefix_stats_daily after profiling."""
+    monkeypatch.setattr(
+        "agents.metadata_profiler.mcp_client.get_object_metadata",
+        lambda *a, **kw: {"content_type": "application/octet-stream", "size_bytes": 2048}
+    )
+    monkeypatch.setattr(
+        "agents.metadata_profiler.mcp_client.lustre_layout",
+        lambda *a, **kw: {"stripe_count": 2, "stripe_size": 1048576, "osts": ["0"]}
+    )
+    monkeypatch.setattr(
+        "agents.metadata_profiler.mcp_client.write_ai_object_features",
+        lambda *a, **kw: {"status": "ok"}
+    )
+
+    prefix_calls = []
+    monkeypatch.setattr(
+        "agents.metadata_profiler.mcp_client.write_prefix_stats_daily",
+        lambda *a, **kw: prefix_calls.append(a) or {"status": "ok"}
+    )
+
+    event = {
+        "event_type": "PutCommitted",
+        "tenant_id": "t1",
+        "bucket": "bkt",
+        "key": "logs/2026/run.log",
+        "object_version": "",
+        "lustre_path": "/lustre/t1/bkt/logs/2026/run.log",
+    }
+    result = metadata_profiler.process(event)
+
+    assert result is True
+    assert len(prefix_calls) == 1
+    # positional args: (tenant_id, bucket, prefix, day, stats)
+    _, _, prefix_arg, _, stats_arg = prefix_calls[0]
+    assert prefix_arg == "logs/2026/"
+    assert stats_arg["put_count"] == 1
+    assert stats_arg["dominant_category"] == "logs"
+
+
+def test_metadata_profiler_prefix_stats_failure_is_nonfatal(monkeypatch):
+    """A failure in write_prefix_stats_daily must not cause process() to return False."""
+    monkeypatch.setattr(
+        "agents.metadata_profiler.mcp_client.get_object_metadata",
+        lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        "agents.metadata_profiler.mcp_client.lustre_layout",
+        lambda *a, **kw: {}
+    )
+    monkeypatch.setattr(
+        "agents.metadata_profiler.mcp_client.write_ai_object_features",
+        lambda *a, **kw: {"status": "ok"}
+    )
+    monkeypatch.setattr(
+        "agents.metadata_profiler.mcp_client.write_prefix_stats_daily",
+        lambda *a, **kw: _raise(Exception("Cassandra timeout"))
+    )
+
+    event = {"event_type": "PutCommitted", "tenant_id": "t1",
+             "bucket": "b", "key": "path/file.parquet", "object_version": ""}
+    result = metadata_profiler.process(event)
+    # prefix stats failure is non-fatal; object features were written successfully
+    assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Hotness Agent – prefix stats
+# ---------------------------------------------------------------------------
+
+def test_hotness_agent_updates_prefix_stats(monkeypatch):
+    """Hotness agent must call write_prefix_stats_daily after updating object hotness."""
+    monkeypatch.setattr(
+        "agents.hotness_agent.mcp_client.get_ai_object_features",
+        lambda *a, **kw: {"hotness_score": 3.0}
+    )
+    monkeypatch.setattr(
+        "agents.hotness_agent.mcp_client.write_ai_object_features",
+        lambda *a, **kw: {"status": "ok"}
+    )
+
+    prefix_calls = []
+    monkeypatch.setattr(
+        "agents.hotness_agent.mcp_client.write_prefix_stats_daily",
+        lambda *a, **kw: prefix_calls.append(a) or {"status": "ok"}
+    )
+
+    event = {
+        "event_type": "Get",
+        "tenant_id": "t2",
+        "bucket": "data",
+        "key": "reports/2026/q1.parquet",
+        "object_version": "",
+    }
+    result = hotness_agent.process(event)
+
+    assert result is True
+    assert len(prefix_calls) == 1
+    _, _, prefix_arg, _, stats_arg = prefix_calls[0]
+    assert prefix_arg == "reports/2026/"
+    assert stats_arg["get_count"] == 1
+    assert "hotness_score" in stats_arg
+
+
+def test_hotness_agent_prefix_stats_failure_is_nonfatal(monkeypatch):
+    """A failure in write_prefix_stats_daily must not prevent the hotness update."""
+    monkeypatch.setattr(
+        "agents.hotness_agent.mcp_client.get_ai_object_features",
+        lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        "agents.hotness_agent.mcp_client.write_ai_object_features",
+        lambda *a, **kw: {"status": "ok"}
+    )
+    monkeypatch.setattr(
+        "agents.hotness_agent.mcp_client.write_prefix_stats_daily",
+        lambda *a, **kw: _raise(Exception("Redis down"))
+    )
+
+    event = {"event_type": "Get", "tenant_id": "t1", "bucket": "b",
+             "key": "dir/obj.bin", "object_version": ""}
+    result = hotness_agent.process(event)
+    assert result is True
     score = hotness_agent._decayed_score(None, 0.9)
     assert score == 1.0
 

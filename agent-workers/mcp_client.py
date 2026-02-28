@@ -71,3 +71,19 @@ def get_ai_object_features(tenant_id: str, bucket: str, object_key: str,
         "tenant_id": tenant_id, "bucket": bucket,
         "object_key": object_key, "object_version": object_version,
     })
+
+
+def write_prefix_stats_daily(
+    tenant_id: str,
+    bucket: str,
+    prefix: str,
+    day: str,
+    stats: dict[str, Any],
+) -> dict[str, str] | None:
+    return _post("/tools/write_prefix_stats_daily", {  # type: ignore[return-value]
+        "tenant_id": tenant_id,
+        "bucket": bucket,
+        "prefix": prefix,
+        "day": day,
+        "stats": stats,
+    })
