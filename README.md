@@ -3,10 +3,9 @@
 **"Strata" -> storage layers** -- Lustre connection + tiering intelligence with AI.
 
 StrataAI is a **Cognitive Agentic Storage Control Plane** for HPC environments.
-It continuously observes a [Lustre](https://www.lustre.org/) filesystem, scores every
-file with an AI-based heat model and automatically migrates files across
-storage tiers (hot -> warm -> cold) to maximise both performance and cost
-efficiency.
+It combines a Lustre filesystem connector, an AI-driven tiering engine, an MCP
+Agent Orchestrator with RAG retrieval, a Cassandra metadata backend, an IAM
+policy layer, and an AI Gateway into one cohesive system.
 
 ---
 
@@ -14,98 +13,134 @@ efficiency.
 
 ```
 +----------------------------------------------------------+
-|                      StrataAgent                         |
-|           (Observe -> Analyse -> Plan -> Act loop)       |
-+--------------+------------------+-----------------------+
-|  LustreConn  |  PatternAnalyzer |    TieringEngine       |
-|  (lfs CLI)   |  (heat scoring)  |  (migration driver)   |
-+--------------+------------------+-----------------------+
-        |                |                  |
-   Lustre mount     Access events      OST pool migration
+|                        User                              |
++---------------------------+------------------------------+
+                            |
++---------------------------v------------------------------+
+|                      AI Gateway                          |
++---------------------------+------------------------------+
+                            |
++---------------------------v------------------------------+
+|              Agent Orchestrator (MCP)                    |
++------------------+-------------------+------------------+
+                   |                   |
+     +-------------v------+   +--------v--------------+
+     |   Tool Calls (MCP) |   |   RAG Retrieval        |
+     |  getObjectMetadata |   |  (Vector DB)           |
+     |  getBucketStats    |   |                        |
+     |  getUserPolicy     |   |  - usage patterns      |
+     +------+------+------+   |  - object classif.     |
+            |      |          |  - policy knowledge    |
+     +------v+  +--v------+   +--------+--------------+
+     |Cassandra|  | IAM    |            |
+     | Backend |  | Layer  |   Metadata Embeddings
+     +---------+  +--------+   + Logs
+                            |
+             +--------------v--------------+
+             |      LLM reasoning          |
+             |   over tool + RAG context   |
+             +------------------------------+
 ```
 
-### Key components
+### Module overview
 
 | Module | Description |
 |--------|-------------|
-| `strataai.lustre` | Abstracts the Lustre `lfs` CLI (`getstripe`, `migrate`, `find`) |
-| `strataai.tiering.tiers` | Hot / Warm / Cold tier definitions mapped to Lustre OST pools |
-| `strataai.tiering.policy` | Rule-based `ThresholdPolicy`; pluggable via `TieringPolicy` protocol |
-| `strataai.tiering.engine` | Drives file migration and tracks capacity accounting |
-| `strataai.intelligence` | Time-decayed heat scoring with `PatternAnalyzer` |
-| `strataai.control_plane` | `StrataAgent` -- the autonomous background orchestrator |
+| `strataai.lustre` | Lustre `lfs` CLI abstraction (`getstripe`, `migrate`, `find`) |
+| `strataai.tiering` | Hot/Warm/Cold tier definitions, threshold policy, migration engine |
+| `strataai.intelligence` | Time-decayed heat scoring (`PatternAnalyzer`) |
+| `strataai.control_plane` | `StrataAgent` – background Observe->Analyse->Plan->Act loop |
+| `strataai.storage.cassandra` | `ObjectMetadata`, `BucketStats`, `InMemoryCassandraBackend` |
+| `strataai.storage.iam` | `UserPolicy`, `IamLayer`, `InMemoryIamBackend` |
+| `strataai.rag.store` | `InMemoryVectorStore` – TF-normalised bag-of-words cosine similarity |
+| `strataai.rag.retriever` | `RagRetriever` – usage patterns / object classification / policy knowledge |
+| `strataai.mcp.tools` | `McpTools` – `getObjectMetadata()`, `getBucketStats()`, `getUserPolicy()` |
+| `strataai.mcp.orchestrator` | `AgentOrchestrator` – tool calls + RAG + LLM reasoning |
+| `strataai.gateway` | `AiGateway` – single entry point for user requests |
 
 ---
 
 ## Quick start
 
 ```python
-from strataai import LustreConnector, StrataAgent
+from strataai import (
+    AiGateway,
+    AgentOrchestrator,
+    GatewayRequest,
+    InMemoryCassandraBackend,
+    InMemoryIamBackend,
+    InMemoryVectorStore,
+    IamLayer,
+    McpTools,
+    RagRetriever,
+)
+from strataai.rag.retriever import CATEGORY_USAGE_PATTERN
+from strataai.rag.store import Document
+from strataai.storage.cassandra import ObjectMetadata, BucketStats
 
-# Point at your Lustre mount
-connector = LustreConnector(mount_point="/lustre/scratch")
+# --- Storage layer ---
+cass = InMemoryCassandraBackend()
+cass.put_object_metadata(
+    ObjectMetadata(bucket="scratch", key="sim/output.h5", size_bytes=10 * 1024**3, tier="warm")
+)
+cass.update_bucket_stats(BucketStats(bucket="scratch", object_count=1, total_bytes=10 * 1024**3))
 
-# Create the agent with default hot/warm/cold tiers
-agent = StrataAgent(connector=connector, dry_run=False)
+# --- IAM layer ---
+iam = IamLayer(backend=InMemoryIamBackend())
 
-# Register I/O events (typically driven by Lustre changelogs)
-agent.analyzer.record_access("/lustre/scratch/simulation/output.h5")
+# --- RAG retrieval ---
+store = InMemoryVectorStore()
+store.add(Document(
+    text="simulation output accessed hourly by post-processing jobs",
+    category=CATEGORY_USAGE_PATTERN,
+))
+retriever = RagRetriever(store=store)
 
-# Run one full observe-analyse-plan-act cycle
-records = agent.tick(directory="/lustre/scratch/simulation")
-for r in records:
-    print(f"{r.path}: {r.from_tier.name} -> {r.to_tier.name} (ok={r.success})")
+# --- MCP tools + orchestrator ---
+tools = McpTools(cassandra=cass, iam=iam)
+orchestrator = AgentOrchestrator(tools=tools, retriever=retriever)
 
-# Or start the autonomous background loop
-agent.start()
-# ... later ...
-agent.stop()
+# --- AI Gateway ---
+gateway = AiGateway(orchestrator=orchestrator)
+response = gateway.process(GatewayRequest(
+    user_id="alice",
+    query="should sim/output.h5 be promoted to the hot tier?",
+    bucket="scratch",
+    object_key="sim/output.h5",
+))
+print(response.answer)
+print(f"Tool calls: {response.tool_results_count}, RAG docs: {response.retrieved_docs_count}")
 ```
 
 ---
 
-## Storage tiers
+## MCP tool calls
+
+| Tool | Arguments | Returns |
+|------|-----------|---------|
+| `getObjectMetadata(bucket, key)` | bucket name, object key | `ObjectMetadata` |
+| `getBucketStats(bucket)` | bucket name | `BucketStats` |
+| `getUserPolicy(user_id)` | user identifier | `UserPolicy` |
+
+---
+
+## RAG retrieval categories
+
+| Category | Constant | Description |
+|----------|----------|-------------|
+| Usage patterns | `CATEGORY_USAGE_PATTERN` | Historical I/O access patterns |
+| Object classification | `CATEGORY_OBJECT_CLASSIFICATION` | Size, type, and access profile docs |
+| Policy knowledge | `CATEGORY_POLICY_KNOWLEDGE` | IAM rules and examples |
+
+---
+
+## Storage tiers (Lustre)
 
 | Tier | Pool name | Typical backing | Default stripe count |
 |------|-----------|-----------------|----------------------|
 | HOT  | `hot`     | NVMe flash OSTs | 4 |
 | WARM | `warm`    | HDD OSTs        | 2 |
 | COLD | `cold`    | Tape / nearline | 1 |
-
-Pool names, capacities and stripe settings are fully configurable:
-
-```python
-from strataai.tiering.tiers import StorageTier, TierLevel
-
-tiers = [
-    StorageTier(level=TierLevel.HOT,  pool="nvme",  capacity_bytes=5 * 1024**4),
-    StorageTier(level=TierLevel.WARM, pool="sas",   capacity_bytes=50 * 1024**4),
-    StorageTier(level=TierLevel.COLD, pool="tape",  capacity_bytes=0),  # unlimited
-]
-```
-
----
-
-## Tiering intelligence
-
-Heat is computed as a **time-decayed access frequency**:
-
-```
-heat = min(1.0, access_count / N * exp(-lambda * age_seconds))
-```
-
-- `N` -- normalisation factor (default 100 accesses = 1.0 heat)
-- `lambda` -- decay constant (default `1e-5` /s, half-life ~19 hours)
-
-The `ThresholdPolicy` then maps heat to a tier:
-
-| Heat range    | Action         |
-|---------------|----------------|
-| >= 0.70       | Promote to HOT |
-| 0.20 -- 0.70  | Keep on WARM   |
-| < 0.20        | Demote to COLD |
-
-Both thresholds are configurable.
 
 ---
 
